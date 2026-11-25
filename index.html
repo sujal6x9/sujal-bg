@@ -646,6 +646,11 @@ body.dragging .drop-veil { display: flex; }
   .workspace { order: 0; }
   .panel { order: 1; }
 }
+
+/* Fix and enhance */
+.quick .check { margin: 12px 0 0; }
+.wand-btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.stage.cursor-wand #viewCanvas { cursor: crosshair; }
   </style>
 </head>
 <body>
@@ -691,6 +696,24 @@ body.dragging .drop-veil { display: flex; }
         </label>
         <p id="fileName" class="file-name">No image loaded</p>
       </section>
+
+      <section class="group quick">
+        <h2 class="group-title">Fix and enhance</h2>
+        <button type="button" class="btn btn-outline btn-block wand-btn" data-tool="wand" aria-pressed="false" title="Click to remove background (W)">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 16 13 7M12 3v2M12 9v2M8 7h2M14 7h2M15.5 3.5l-1 1M15.5 10.5l-1-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>Click to remove background</span>
+        </button>
+        <p class="hint">Turn on, then click any leftover grey area in the preview. Ctrl+Z undoes a click.</p>
+        <label class="check">
+          <input type="checkbox" id="enhance" checked>
+          <span>Sharpen text and details</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="export2x">
+          <span>Download at 2× size (crisper when zoomed or printed)</span>
+        </label>
+      </section>
+
       <div class="primary-action">
         <button type="button" id="downloadBtn" class="btn btn-primary btn-block btn-lg" disabled>
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10M6 9l4 4 4-4M4 16.5h12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -868,6 +891,7 @@ body.dragging .drop-veil { display: flex; }
         <summary>Keyboard shortcuts</summary>
         <dl>
           <dt>B / P / E / H</dt><dd>Mark background, protect, erase, pan</dd>
+          <dt>W</dt><dd>Click to remove background</dd>
           <dt>Space + drag</dt><dd>Pan with any tool</dd>
           <dt>[ and ]</dt><dd>Smaller or larger brush</dd>
           <dt>Ctrl+Z, Ctrl+Shift+Z</dt><dd>Undo, redo</dd>
@@ -973,8 +997,9 @@ body.dragging .drop-veil { display: flex; }
  *      The border fill can step over thin soft lines (glowing connectors),
  *      follows gradients via a fitted surface plus iterative local
  *      re-estimation, and never enters objects lighter than the background.
- *   6. A manual mask layer (Mark Background / Protect Foreground) overrides
- *      the automatic result. It edits the MASK only, never the pixels.
+ *   6. A manual mask layer (Mark Background / Protect Foreground / Click to
+ *      remove) overrides the automatic result. It edits the MASK only, never
+ *      the pixels.
  *   7. Output, three styles:
  *      - Relight (default): every pixel is divided by the local background
  *        colour (flat-field). Background -> pure white, shading/shadows keep
@@ -1027,6 +1052,8 @@ body.dragging .drop-veil { display: flex; }
                         // 'soft' = objects exact + background shading lightened,
                         // 'exact' = every pixel either kept exactly or made white
     flatten: false,
+    enhance: true,      // sharpen text and details (Clean white and Relight styles)
+    export2x: false,    // download at double size
     live: true,
   });
 
@@ -1098,6 +1125,8 @@ body.dragging .drop-veil { display: flex; }
     feather: $('feather'),
     featherValue: $('featherValue'),
     flatten: $('flatten'),
+    enhance: $('enhance'),
+    export2x: $('export2x'),
     downloadBtn: $('downloadBtn'),
     viewTabs: Array.from(document.querySelectorAll('[data-view]')),
     zoomButtons: Array.from(document.querySelectorAll('[data-zoom]')),
@@ -3460,6 +3489,136 @@ body.dragging .drop-veil { display: flex; }
     state.objects = objects;
   }
 
+  /**
+   * ENHANCE: unsharp mask on lightness (grain under 3 levels is ignored, so
+   * noise is not amplified) plus, when `ink` is true, a mild deepening of
+   * dark neutral pixels so grey text reads as solid ink. Brightening clips
+   * at white, so no bright halos appear on the white background.
+   */
+  function enhanceDetail(d, W, H, strength, ink) {
+    const N = W * H;
+    const L = new Float32Array(N);
+    for (let i = 0, o = 0; i < N; i++, o += 4) L[i] = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+    const blur = boxBlur(boxBlur(L, W, H, 1), W, H, 1);
+    for (let i = 0, o = 0; i < N; i++, o += 4) {
+      if (d[o + 3] < 255) continue;
+      const l = L[i];
+      const diff = l - blur[i];
+      const mag = Math.abs(diff);
+      const gate = mag <= 3 ? 0 : mag >= 8 ? 1 : (mag - 3) / 5;
+      const k = clamp(diff * 0.8 * strength * gate, -36, 36);
+      let f = 1;
+      if (ink && l < 150) {
+        const hi = Math.max(d[o], d[o + 1], d[o + 2]);
+        const lo = Math.min(d[o], d[o + 1], d[o + 2]);
+        if (hi - lo < 40) f = 1 - 0.3 * strength * (1 - l / 150);
+      }
+      if (k === 0 && f === 1) continue;
+      d[o] = d[o] * f + k;           // Uint8ClampedArray rounds and clamps
+      d[o + 1] = d[o + 1] * f + k;
+      d[o + 2] = d[o + 2] * f + k;
+    }
+  }
+
+  /**
+   * CLICK TO REMOVE. Flood-fills from the clicked pixel through connected
+   * pixels of a similar original colour that are not yet white, and marks
+   * them as manual background (undoable). The Background tolerance slider
+   * controls how much one click takes.
+   */
+  function magicRemove(pt) {
+    const { width: W, height: H, N, lab, manual } = state;
+    const out = state.procImage.data;
+    const p = toImage(pt);
+    const sx = Math.floor(p.x), sy = Math.floor(p.y);
+    if (sx < 0 || sy < 0 || sx >= W || sy >= H) return;
+    const seed = sy * W + sx;
+    const isWhite = (i) => {
+      const o = i * 4;
+      return out[o] === 255 && out[o + 1] === 255 && out[o + 2] === 255 && out[o + 3] === 255;
+    };
+    if (manual[seed] === MANUAL_PROTECT) {
+      toast('That spot is protected. Erase the protect mark first.', 'warn', 2800);
+      return;
+    }
+    if (isWhite(seed)) {
+      toast('This spot is already white. Click directly on the leftover area.', 'info', 2600);
+      return;
+    }
+
+    // Reference colour: the clicked pixel averaged with similar 3×3 neighbours.
+    const s3 = seed * 3;
+    const nearSq = (6 * LAB_SCALE) ** 2;
+    let rL = 0, rA = 0, rB = 0, cnt = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = sy + dy;
+      if (ny < 0 || ny >= H) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = sx + dx;
+        if (nx < 0 || nx >= W) continue;
+        const k = (ny * W + nx) * 3;
+        const dL = lab[k] - lab[s3], dA = lab[k + 1] - lab[s3 + 1], dB = lab[k + 2] - lab[s3 + 2];
+        if (dL * dL + dA * dA + dB * dB > nearSq) continue;
+        rL += lab[k]; rA += lab[k + 1]; rB += lab[k + 2]; cnt++;
+      }
+    }
+    rL /= cnt; rA /= cnt; rB /= cnt;
+
+    const tolDE = clamp(4 + state.settings.tolerance * 0.3, 5, 24);
+    const tolSq = (tolDE * LAB_SCALE) ** 2;
+    const fits = (i) => {
+      if (manual[i] === MANUAL_PROTECT || isWhite(i)) return false;
+      const k = i * 3;
+      const dL = lab[k] - rL, dA = lab[k + 1] - rA, dB = lab[k + 2] - rB;
+      return dL * dL + dA * dA + dB * dB <= tolSq;
+    };
+
+    const seen = new Uint8Array(N);
+    const queue = new Int32Array(N);
+    const idx = [], prev = [];
+    let head = 0, tail = 0;
+    let x0 = sx, y0 = sy, x1 = sx, y1 = sy;
+    seen[seed] = 1;
+    queue[tail++] = seed;
+    while (head < tail) {
+      const q = queue[head++];
+      const x = q % W, y = (q / W) | 0;
+      idx.push(q);
+      prev.push(manual[q]);
+      manual[q] = MANUAL_BG;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= H) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= W) continue;
+          const n = ny * W + nx;
+          if (seen[n] || !fits(n)) continue;
+          seen[n] = 1;
+          queue[tail++] = n;
+        }
+      }
+    }
+
+    pushHistory({
+      indices: Int32Array.from(idx),
+      prev: Uint8Array.from(prev),
+      value: MANUAL_BG,
+      bbox: [x0, y0, x1 + 1, y1 + 1],
+    });
+    if (needsFullCompose()) composeAll();
+    else {
+      updateRegion(x0, y0, x1 + 1, y1 + 1);
+      updateCoverageInfo();
+      scheduleObjects();
+    }
+    toast(`Removed ${idx.length.toLocaleString()} px. Ctrl+Z to undo.`, 'success', 2200);
+  }
+
   /** Full recomputation of weights, output and overlay. */
   function composeAll() {
     if (!state.autoMask) return;
@@ -3486,6 +3645,9 @@ body.dragging .drop-veil { display: flex; }
       if (state.settings.denoise) smoothCompressionNoise();
       if (state.settings.clarity > 0) applyClarity(state.settings.clarity / 100);
       if (state.settings.cleanup) cleanupFaintMarks();
+    }
+    if (state.settings.enhance && (state.settings.shadows === 'clean' || state.settings.shadows === 'relight')) {
+      enhanceDetail(state.procImage.data, W, H, 1, true);
     }
     // Post-processing must never override either manual brush.
     for (let i = 0, o = 0; i < state.N; i++, o += 4) {
@@ -3726,7 +3888,29 @@ body.dragging .drop-veil { display: flex; }
     const name = outputFileName(state.fileName);
     const { width: W, height: H } = state;
     // procCanvas is exactly W × H and holds the processed pixels via putImageData.
-    state.procCanvas.toBlob((blob) => {
+    let canvas = state.procCanvas;
+    let scale = 1;
+    if (state.settings.export2x) {
+      if (W * 2 > MAX_DIMENSION || H * 2 > MAX_DIMENSION || W * H * 4 > 64000000) {
+        toast('Image is too large for 2× export. Downloading at original size.', 'warn');
+      } else {
+        try {
+          const big = makeCanvas(W * 2, H * 2);
+          const bctx = big.getContext('2d', { willReadFrequently: true });
+          bctx.imageSmoothingEnabled = true;
+          bctx.imageSmoothingQuality = 'high';
+          bctx.drawImage(state.procCanvas, 0, 0, W * 2, H * 2);
+          const img = bctx.getImageData(0, 0, W * 2, H * 2);
+          enhanceDetail(img.data, W * 2, H * 2, 0.7, false);
+          bctx.putImageData(img, 0, 0);
+          canvas = big;
+          scale = 2;
+        } catch (err) {
+          toast('2× export failed (not enough memory). Downloading at original size.', 'warn');
+        }
+      }
+    }
+    canvas.toBlob((blob) => {
       if (!blob) {
         toast('PNG export failed. The browser may be out of memory.', 'error', 6000);
         return;
@@ -3739,7 +3923,7 @@ body.dragging .drop-veil { display: flex; }
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
-      toast(`Downloaded ${name} (${W} × ${H} px).`, 'success');
+      toast(`Downloaded ${name} (${W * scale} × ${H * scale} px).`, 'success');
     }, 'image/png');
   }
 
@@ -4066,13 +4250,14 @@ body.dragging .drop-veil { display: flex; }
       setView('mask');
       toast('Switched to Mask view so you can see your brush marks.', 'info', 2800);
     }
+    if (tool === 'wand' && ['original', 'compare'].includes(state.view) && state.orig) setView('processed');
     updateCursor();
     requestRender();
   }
 
   function updateCursor(pt) {
     const stage = els.stage;
-    stage.classList.remove('cursor-pan', 'cursor-grabbing', 'cursor-brush', 'cursor-split');
+    stage.classList.remove('cursor-pan', 'cursor-grabbing', 'cursor-brush', 'cursor-split', 'cursor-wand');
     if (!state.orig) return;
     const d = state.drag;
     if (d && d.mode === 'pan') return stage.classList.add('cursor-grabbing');
@@ -4083,6 +4268,7 @@ body.dragging .drop-veil { display: flex; }
       return stage.classList.add('cursor-pan');
     }
     if (state.spaceDown || state.tool === 'pan') return stage.classList.add('cursor-pan');
+    if (state.tool === 'wand') return stage.classList.add('cursor-wand');
     stage.classList.add('cursor-brush');
   }
 
@@ -4104,6 +4290,8 @@ body.dragging .drop-veil { display: flex; }
     els.studioRow.classList.toggle('dim', s.shadows !== 'relight');
     els.outlineRow.classList.toggle('dim', ['soft', 'clean'].includes(s.shadows));
     els.flatten.checked = s.flatten;
+    els.enhance.checked = s.enhance;
+    els.export2x.checked = s.export2x;
     els.liveUpdate.checked = s.live;
     updateSliderLabels();
   }
@@ -4331,10 +4519,22 @@ body.dragging .drop-veil { display: flex; }
     state.settings.flatten = els.flatten.checked;
     composeAll();
   });
+  els.enhance.addEventListener('change', () => {
+    state.settings.enhance = els.enhance.checked;
+    composeAll();
+  });
+  els.export2x.addEventListener('change', () => {
+    state.settings.export2x = els.export2x.checked;
+  });
   els.downloadBtn.addEventListener('click', downloadImage);
 
   // Tools and history
-  for (const b of els.toolButtons) b.addEventListener('click', () => setTool(b.dataset.tool));
+  for (const b of els.toolButtons) {
+    b.addEventListener('click', () => {
+      const t = b.dataset.tool;
+      setTool(t === 'wand' && state.tool === 'wand' ? 'pan' : t); // wand button toggles
+    });
+  }
   els.brushSize.addEventListener('input', () => {
     state.settings.brushSize = Number(els.brushSize.value);
     updateSliderLabels();
@@ -4373,6 +4573,11 @@ body.dragging .drop-veil { display: flex; }
     } else if (e.button === 0) {
       if (!state.autoMask) {
         toast('Wait for background detection to finish before painting.', 'warn');
+        return;
+      }
+      if (state.tool === 'wand') {
+        e.preventDefault();
+        magicRemove(pt);
         return;
       }
       mode = 'paint';
@@ -4479,6 +4684,7 @@ body.dragging .drop-veil { display: flex; }
       case 'p': setTool('protect'); break;
       case 'e': setTool('erase'); break;
       case 'h': setTool('pan'); break;
+      case 'w': setTool(state.tool === 'wand' ? 'pan' : 'wand'); break;
       case '[':
       case ']': {
         const delta = key === ']' ? 1 : -1;
